@@ -467,24 +467,18 @@ DiffuBind/
 
 ## 运行环境
 
-项目约定使用 Conda 环境 `wadiff`。下文 Linux 示例假设解释器位于 `/root/miniconda3/envs/wadiff/bin/python`；如果安装位置不同，请替换为本机 `wadiff` 环境的实际 Python 路径。
-
-Windows 工作区的解释器为：
-
-```text
-D:\Anaconda_envs\envs\wadiff\python.exe
-```
+建议使用独立的 Conda 或 Python 虚拟环境。下文命令均假设环境已经激活，并且 `python`、`pip` 已加入当前终端的 `PATH`，不依赖任何本机绝对路径或特定环境名称。
 
 Windows 安装核心依赖：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Linux 安装核心依赖：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 `requirements.txt` 包含核心训练依赖。附加功能需要按用途安装：
@@ -498,7 +492,7 @@ Linux 安装核心依赖：
 正式配置默认指向 COCO 2017 风格目录：
 
 ```text
-/root/autodl-tmp/datasets/
+/path/to/datasets/
 |-- train2017/
 `-- val2017/
 ```
@@ -524,13 +518,13 @@ data:
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml
+python train_watermark_diffusion.py --config configs\watermark_stage1.yaml
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+python train_watermark_diffusion.py \
   --config configs/watermark_stage1.yaml
 ```
 
@@ -539,15 +533,15 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\best.pt
+python train_watermark_diffusion.py --config configs\watermark_stage1.yaml --init_from checkpoints\stage1\best.pt
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+python train_watermark_diffusion.py \
   --config configs/watermark_stage1.yaml \
-  --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/best.pt
+  --init_from checkpoints/stage1/best.pt
 ```
 
 同一阶段中断恢复。
@@ -555,15 +549,15 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml --resume checkpoints_stage1_strict_texture_30bit_fine_v2\latest.pt
+python train_watermark_diffusion.py --config configs\watermark_stage1.yaml --resume checkpoints\stage1\latest.pt
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+python train_watermark_diffusion.py \
   --config configs/watermark_stage1.yaml \
-  --resume checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
+  --resume checkpoints/stage1/latest.pt
 ```
 
 ### 第二阶段
@@ -573,15 +567,15 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage2.yaml --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\best.pt
+python train_watermark_diffusion.py --config configs\watermark_stage2.yaml --init_from checkpoints\stage1\best.pt
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+python train_watermark_diffusion.py \
   --config configs/watermark_stage2.yaml \
-  --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/best.pt
+  --init_from checkpoints/stage1/best.pt
 ```
 
 当前配置只要求新 Stage 2 提供某个 `--init_from`；`expected_init_from` 仍是注释，不会强制具体文件名。请自行确保它确实来自结构匹配的 Stage 1 Full。
@@ -591,15 +585,15 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage2.yaml --resume checkpoints_stage2_one_shot_relaxed_v1\latest.pt
+python train_watermark_diffusion.py --config configs\watermark_stage2.yaml --resume checkpoints\stage2\latest.pt
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+python train_watermark_diffusion.py \
   --config configs/watermark_stage2.yaml \
-  --resume checkpoints_stage2_one_shot_relaxed_v1/latest.pt
+  --resume checkpoints/stage2/latest.pt
 ```
 
 `--resume` 与 `--init_from` 互斥：前者恢复模型、Decoder、optimizer、AMP scaler、step 与 RNG；后者只初始化模型/Decoder，并从新 optimizer 和 `global_step=0` 开始。
@@ -618,35 +612,35 @@ Linux：
 单图示例（Windows）：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" sample_embed_watermark.py `
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+python sample_embed_watermark.py `
+  --checkpoint checkpoints\stage2\best.pt `
   --config configs\watermark_stage2.yaml `
   --input test_images\test.png `
   --watermark "101100101011001010110010101100" `
-  --output outputs_stage2_one_shot_relaxed_v1\watermarked.png `
+  --output outputs\stage2\watermarked.png `
   --t_start 200
 ```
 
 单图示例（Linux）：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+python sample_embed_watermark.py \
+  --checkpoint checkpoints/stage2/best.pt \
   --config configs/watermark_stage2.yaml \
   --input test_images/test.png \
   --watermark "101100101011001010110010101100" \
-  --output outputs_stage2_one_shot_relaxed_v1/watermarked.png \
+  --output outputs/stage2/watermarked.png \
   --t_start 200
 ```
 
 目录批处理并导出固定退化（Windows）：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" sample_embed_watermark.py `
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+python sample_embed_watermark.py `
+  --checkpoint checkpoints\stage2\best.pt `
   --config configs\watermark_stage2.yaml `
   --input test_images `
-  --output outputs_stage2_one_shot_relaxed_v1\watermarked_batch `
+  --output outputs\stage2\watermarked_batch `
   --t_start 200 `
   --noise_layer mixed `
   --save_degraded `
@@ -656,11 +650,11 @@ Linux：
 目录批处理并导出固定退化（Linux）：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+python sample_embed_watermark.py \
+  --checkpoint checkpoints/stage2/best.pt \
   --config configs/watermark_stage2.yaml \
   --input test_images \
-  --output outputs_stage2_one_shot_relaxed_v1/watermarked_batch \
+  --output outputs/stage2/watermarked_batch \
   --t_start 200 \
   --noise_layer mixed \
   --save_degraded \
@@ -682,8 +676,8 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" eval_watermark_robustness.py `
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+python eval_watermark_robustness.py `
+  --checkpoint checkpoints\stage2\best.pt `
   --config configs\watermark_stage2.yaml `
   --noise_layers clean,pimog,oled,led,projector `
   --t_start 200 `
@@ -694,14 +688,14 @@ Windows：
   --num_visual_samples 16 `
   --noise_strength 1.0 `
   --attack_repeats 1 `
-  --output outputs_stage2_one_shot_relaxed_v1\eval_results_500.csv
+  --output outputs\stage2\eval_results_500.csv
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python eval_watermark_robustness.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+python eval_watermark_robustness.py \
+  --checkpoint checkpoints/stage2/best.pt \
   --config configs/watermark_stage2.yaml \
   --noise_layers clean,pimog,oled,led,projector \
   --t_start 200 \
@@ -712,7 +706,7 @@ Linux：
   --num_visual_samples 16 \
   --noise_strength 1.0 \
   --attack_repeats 1 \
-  --output outputs_stage2_one_shot_relaxed_v1/eval_results_500.csv
+  --output outputs/stage2/eval_results_500.csv
 ```
 
 支持的指标包括：
@@ -734,13 +728,13 @@ Linux：
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" manual_inspection.py
+python manual_inspection.py
 ```
 
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python manual_inspection.py
+python manual_inspection.py
 ```
 
 ### 仅使用解码器的真实屏摄评测
@@ -762,8 +756,8 @@ real captured image
 Windows：
 
 ```powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" eval_real_screen.py `
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+python eval_real_screen.py `
+  --checkpoint checkpoints\stage2\best.pt `
   --input_dir real_screen_photos\rectified `
   --watermark "101100101011001010110010101100" `
   --device cuda
@@ -772,8 +766,8 @@ Windows：
 Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python eval_real_screen.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+python eval_real_screen.py \
+  --checkpoint checkpoints/stage2/best.pt \
   --input_dir real_screen_photos/rectified \
   --watermark "101100101011001010110010101100" \
   --device cuda
@@ -809,7 +803,7 @@ Linux：
 5. sample/eval 对 diffusion model 使用 `strict=False` 加载；出现 missing/unexpected/mismatched 提示时，不应把结果视为可靠实验。
 6. 训练期 fixed matrix 基于 single-step `pred_x0`，不是完整 DDPM embedding；它适合稳定排序，但不能代替最终多步评估。
 7. `requirements.txt` 未覆盖人工校正、可选 LPIPS 和部分诊断脚本的全部附加依赖。
-8. Stage 2 YAML 顶部示例注释仍引用旧文件名 `watermark_stage2_one_shot_relaxed_v1.yaml`；仓库中的正式路径是 `configs/watermark_stage2.yaml`。
+8. Stage 2 YAML 顶部的命令示例仍引用一个已经停用的旧配置文件名；仓库中的正式路径是 `configs/watermark_stage2.yaml`。
 9. `PROJECT_MANUAL.md` 和 `manual_inspection.py` 的部分中文注释存在历史编码痕迹，不影响本文所述 Python 主链逻辑。
 
 ## 实验结果
@@ -826,7 +820,7 @@ Experimental results will be added after the final evaluation.
 
 本项目使用并改造了 guided-diffusion 风格的 U-Net/DDPM 实现，并参考了以下方向：
 
-- WaDiff: *A Watermark-Conditioned Diffusion Model for IP Protection*；
+- WaDiff：*A Watermark-Conditioned Diffusion Model for IP Protection*；
 - PIMoG: *An Effective Screen-shooting Noise-Layer Simulation for Deep-Learning-Based Watermarking Network*；
 - projector-camera forward modeling / DeProCams 思路。
 
