@@ -1,0 +1,393 @@
+# One-shot Stage 2: progressive degradation training with moderately relaxed guidance.
+#
+# Initialize directly from the completed Stage 1 Full checkpoint with --init_from.
+# Do not use --resume for the first run. Use --resume only to continue this same
+# one-shot experiment after interruption.
+#
+# Linux:
+#   python train_watermark_diffusion.py \
+#     --config configs/watermark_stage2_one_shot_relaxed_v1.yaml \
+#     --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
+#
+# Windows:
+#   & "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py `
+#     --config configs\watermark_stage2_one_shot_relaxed_v1.yaml `
+#     --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\latest.pt
+
+initialization:
+  require_init_from_on_new_run: true
+  # expected_init_from: ./checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
+
+data:
+  train_dir: /root/autodl-tmp/datasets/train2017
+  val_dir: /root/autodl-tmp/datasets/val2017
+  image_size: 128
+  watermark_length: 30
+  watermark_seed: 42
+  train_watermark_mode: per_epoch
+  val_watermark_mode: fixed
+  max_train_images: 10000
+  max_val_images: 1000
+
+model:
+  base_channels: 64
+  cond_dim: 256
+  use_pretrained_unet: false
+  pretrained_path: null
+  use_watermark_time_emb: true
+  use_watermark_spatial_map: true
+  wm_map_channels: 4
+  wm_map_size: 16
+  wm_time_scale: 1.0
+  wm_map_scale: 1.0
+  use_content_gated_wm_map: true
+  wm_map_flat_floor: 0.07
+
+decoder:
+  type: residual_multiscale
+  base_channels: 32
+  hidden_dim: 512
+  dropout: 0.1
+  norm_groups: 8
+  use_multiscale: true
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear
+  wm_t_min: 0
+  wm_t_max: 200
+  train_t_start: 200
+  sample_steps: 100
+
+train:
+  seed: 42
+  deterministic: false
+  batch_size: 32
+  num_workers: 8
+  stage: stage2_one_shot_relaxed_v1
+
+  # Load Stage 1 model/decoder weights only and start a fresh Stage 2 AdamW.
+  lr: 0.00001
+  encoder_train_mode: partial
+  allow_encoder_mode_resume: true
+  partial_output_blocks: 3
+  freeze_watermark_map_mlp: false
+  encoder_lr: 0.000001
+  decoder_lr: 0.00002
+  epochs: 100
+  device: cuda
+  use_amp: true
+  amp_init_scale: 1024.0
+  amp_growth_interval: 2000
+  amp_min_scale: 1.0
+  amp_reset_scale_on_resume_below: 16.0
+  max_grad_norm: 1.0
+  max_consecutive_nonfinite: 5
+
+  # Clean extraction is already saturated. Preserve it with a smaller anchor
+  # and devote more of the objective to hard degraded examples.
+  lambda_diff: 0.1
+  lambda_img: 3.0
+  lambda_wm: 1.5
+  lambda_wm_clean: 1.0
+  lambda_delta: 0.0
+  lambda_tv: 0.0
+  lambda_topk: 0.0
+  lambda_channel: 0.2
+  lambda_region: 0.275
+  topk_delta_fraction: 0.01
+
+  # Compromise between relaxed V2 and accuracy-first V3. This is permissive
+  # enough for robust training from Stage 1 while retaining visual safeguards.
+  residual_constraint:
+    enabled: true
+    flat_max_abs_delta_01: 0.0035
+    texture_max_abs_delta_01: 0.050
+    mask_power: 2.1
+    eps: 1.0e-6
+
+  # All four attacks share one pred_x0. The stronger worst-case weight focuses
+  # optimization on LED/PIMoG without discarding the mean objective.
+  multi_attack:
+    enabled: true
+    attacks_per_batch: 4
+    lambda_mean: 0.30
+    lambda_worst: 0.70
+
+  region_guidance:
+    enabled: true
+    mode: strict_multiscale
+    loss_mode: energy_ratio
+    edge_scales: [1, 3, 5, 7]
+    texture_scales: [3, 5, 7, 9]
+    edge_weight: 0.60
+    texture_weight: 0.40
+    target_mask_area: 0.31
+    mask_temperature: 0.048
+    dilation_kernel: 1
+    blur_kernel: 1
+    gamma: 3.0
+    min_penalty: 0.025
+    min_active_area: 0.08
+    start_inside_ratio: 0.65
+    target_inside_ratio: 0.80
+    start_max_outside_ratio: 0.35
+    max_outside_ratio: 0.20
+    ratio_warmup_steps: 5000
+    warmup_steps: 1000
+
+  residual_spectral:
+    enabled: true
+    start_step: 2000
+    warmup_steps: 1000
+    lambda_peak: 0.02
+    lambda_anisotropy: 0.01
+    max_peak_ratio: 0.20
+    max_directional_ratio: 2.0
+
+  # Gradually shift optimization from conservative Stage 1 preservation toward
+  # the relaxed robust carrier used by the high-strength phases.
+  use_loss_schedule: true
+  loss_schedule:
+    - until_step: 6000
+      lambda_diff: 0.1
+      lambda_img: 3.0
+      lambda_wm: 1.5
+      lambda_delta: 0.0
+      lambda_tv: 0.0
+      lambda_topk: 0.0
+      lambda_channel: 0.2
+      lambda_region: 0.35
+
+    - until_step: 18000
+      lambda_diff: 0.1
+      lambda_img: 2.75
+      lambda_wm: 1.5
+      lambda_delta: 0.0
+      lambda_tv: 0.0
+      lambda_topk: 0.0
+      lambda_channel: 0.2
+      lambda_region: 0.30
+
+    - until_step: -1
+      lambda_diff: 0.1
+      lambda_img: 2.5
+      lambda_wm: 1.5
+      lambda_delta: 0.0
+      lambda_tv: 0.0
+      lambda_topk: 0.0
+      lambda_channel: 0.15
+      lambda_region: 0.275
+
+  # Full one-shot curriculum. With 10,000 images and batch_size=32, the
+  # boundaries correspond approximately to epochs 6, 19, 38, 58, 77 and 90.
+  noise_curriculum:
+    - until_step: 2000
+      apply_prob: 0.30
+      strength: 0.25
+      lambda_wm_clean: 1.0
+      lambda_wm_degraded: 0.5
+      detach_degraded_from_model: true
+      lr_scale: 0.5
+      candidates: [projector, oled]
+      probs: [0.50, 0.50]
+
+    - until_step: 6000
+      apply_prob: 0.50
+      strength: 0.40
+      lambda_wm_clean: 0.9
+      lambda_wm_degraded: 1.0
+      detach_degraded_from_model: false
+      lr_scale: 0.75
+      candidates: [projector, oled, pimog]
+      probs: [0.35, 0.35, 0.30]
+
+    - until_step: 12000
+      apply_prob: 0.70
+      strength: 0.60
+      lambda_wm_clean: 0.75
+      lambda_wm_degraded: 1.5
+      detach_degraded_from_model: false
+      lr_scale: 1.0
+      candidates: [pimog, oled, led, projector]
+      probs: [0.30, 0.20, 0.35, 0.15]
+
+    - until_step: 18000
+      apply_prob: 0.85
+      strength: 0.75
+      lambda_wm_clean: 0.60
+      lambda_wm_degraded: 1.5
+      detach_degraded_from_model: false
+      lr_scale: 1.0
+      candidates: [pimog, oled, led, projector]
+      probs: [0.33, 0.15, 0.37, 0.15]
+
+    - until_step: 24000
+      apply_prob: 1.0
+      strength: 0.90
+      lambda_wm_clean: 0.50
+      lambda_wm_degraded: 1.75
+      detach_degraded_from_model: false
+      lr_scale: 1.0
+      candidates: [pimog, oled, led, projector]
+      probs: [0.35, 0.10, 0.40, 0.15]
+
+    - until_step: 28000
+      apply_prob: 1.0
+      strength: 1.00
+      lambda_wm_clean: 0.40
+      lambda_wm_degraded: 2.0
+      detach_degraded_from_model: false
+      lr_scale: 1.0
+      candidates: [pimog, oled, led, projector]
+      probs: [0.35, 0.10, 0.40, 0.15]
+
+    - until_step: -1
+      apply_prob: 1.0
+      strength: 0.95
+      lambda_wm_clean: 0.40
+      lambda_wm_degraded: 1.75
+      detach_degraded_from_model: false
+      lr_scale: 0.5
+      candidates: [pimog, oled, led, projector]
+      probs: [0.35, 0.10, 0.40, 0.15]
+
+  save_interval: 1
+  sample_interval: 1000
+  log_interval: 100
+  debug_interval: 500
+  reset_decoder: false
+
+validation:
+  seed: 4242
+  sync_curriculum_strength: true
+  evaluate_per_type: true
+  fixed_strengths: [0.55, 0.70, 0.85, 1.00]
+  fixed_candidates: [pimog, oled, led, projector]
+  fixed_matrix_interval: 1
+  # Double the previous validation coverage while keeping each epoch practical.
+  # This also increases batch-level LED pitch/downsampling draws from 8 to 16.
+  fixed_matrix_max_batches: 16
+  use_fixed_matrix_for_checkpoint: true
+
+noise_layer:
+  type: mixed
+
+  pimog:
+    p: 1.0
+
+  oled:
+    p: 1.0
+    subpixel_mode: pentile
+    enable_tone: true
+    enable_subpixel: true
+    enable_display_blur: true
+    enable_perspective: true
+    enable_camera_blur: true
+    enable_banding: true
+    enable_view_color_shift: true
+    enable_noise: true
+    enable_reflection: true
+    enable_resample: false
+    use_jpeg: false
+    gamma_range: [0.85, 1.25]
+    contrast_range: [1.05, 1.35]
+    saturation_range: [1.05, 1.45]
+    black_crush_range: [0.00, 0.08]
+    highlight_clip_prob: 0.30
+    highlight_clip_range: [0.92, 1.00]
+    brightness_jitter: 0.03
+    color_gain_range: [0.96, 1.04]
+    subpixel_prob: 0.70
+    subpixel_strength_range: [0.03, 0.15]
+    subpixel_blur_sigma_range: [0.20, 0.80]
+    display_blur_sigma_range: [0.20, 0.80]
+    perspective_strength_range: [0.00, 0.018]
+    camera_blur_sigma_range: [0.40, 1.50]
+    banding_prob: 0.50
+    banding_strength_range: [0.015, 0.080]
+    banding_frequency_range: [4.0, 32.0]
+    banding_tilt_range: [-0.15, 0.15]
+    view_color_shift_prob: 0.50
+    view_color_shift_strength_range: [0.01, 0.08]
+    reflection_prob: 0.35
+    reflection_strength_range: [0.02, 0.12]
+    haze_strength_range: [0.00, 0.06]
+    noise_std_range: [0.002, 0.020]
+    motion_blur_prob: 0.20
+    motion_blur_kernel_range: [3, 9]
+    resample_scale_range: [0.92, 1.08]
+    jpeg_quality_range: [55.0, 95.0]
+
+  led:
+    p: 1.0
+    severity: medium
+    subpixel_mode: rgb_triplet
+    dot_shape: gaussian
+    pixel_pitch_min: 4
+    pixel_pitch_max: 10
+    grid_strength: 0.18
+    dot_radius: [0.28, 0.40]
+    dot_strength: [0.95, 1.16]
+    downsample_min: 0.35
+    downsample_max: 0.75
+    bloom_strength: 0.12
+    brightness_jitter: 0.15
+    color_shift: 0.08
+    moire_strength: 0.08
+    view_falloff_strength: 0.12
+    noise_std: 0.015
+    enable_scanline: true
+    scanline_prob: 0.35
+    scanline_strength: [0.02, 0.07]
+    scanline_frequency: [4.0, 18.0]
+    enable_moire: true
+    enable_perspective: true
+    highlight_clip: true
+
+  projector:
+    p: 1.0
+    gamma_range: [1.1, 1.8]
+    brightness_gain: [1.00, 1.15]
+    falloff_strength: [0.06, 0.20]
+    hotspot_strength: [0.00, 0.10]
+    hotspot_sigma: [0.5, 1.2]
+    texture_strength: [0.015, 0.06]
+    pixel_grid_strength: [0.00, 0.02]
+    moire_strength: [0.00, 0.02]
+    blur_sigma: [0.15, 0.8]
+    blur_kernel_choices: [3, 5]
+    blur_mix_range: [0.20, 0.70]
+    perspective_distortion: [0.015, 0.06]
+    lens_distortion: [0.00, 0.03]
+    contrast_range: [0.78, 1.00]
+    ambient_light_range: [0.00, 0.10]
+    color_gain_range: [0.92, 1.08]
+    color_bias_range: [-0.015, 0.015]
+    noise_std_range: [0.000, 0.012]
+    enable_gamma: true
+    enable_falloff: true
+    enable_hotspot: true
+    enable_texture: true
+    enable_pixel_grid: false
+    enable_moire: false
+    enable_blur: true
+    enable_perspective: true
+    enable_lens: false
+    enable_ambient: true
+    enable_color: true
+    enable_noise: true
+
+  mixed:
+    candidates: [pimog, oled, led, projector]
+    probs: [0.35, 0.10, 0.40, 0.15]
+
+output:
+  checkpoint_dir: ./checkpoints_stage2_one_shot_relaxed_v1
+  sample_dir: ./outputs_stage2_one_shot_relaxed_v1/samples
+  log_dir: ./outputs_stage2_one_shot_relaxed_v1/logs
+
+
+
+
+

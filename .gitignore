@@ -1,0 +1,42 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs and experiment artifacts
+outputs/
+outputs_stage*/
+noise_layer_debug/
+checkpoints/
+checkpoints_stage*/
+data/
+real_screen_photos*/
+tmp/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Local paper materials and publication figures
+docs/
+figures/
+paper/
+
+# Local environment files
+.env
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# OS metadata
+.DS_Store
+Thumbs.db
