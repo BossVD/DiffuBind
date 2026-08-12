@@ -1,630 +1,707 @@
-# WaDiff — 基于扩散模型的水印嵌入与屏摄鲁棒性实验
+# DiffuBind：面向跨设备屏摄的载体锚定扩散水印
 
-## 核心思路
+**DiffuBind: Carrier-Anchored Diffusion Watermarking for Cross-Device Screen Recapture**
 
+DiffuBind 是一个面向显示器、OLED、LED 大屏和投影设备屏摄场景的扩散水印实验框架。系统以已有载体图像（carrier / cover）为锚点，通过 image-to-image diffusion 进行内容保持的重构，并在反向去噪过程中同时注入全局与空间二进制水印条件。当前正式配置使用 `128×128` RGB 图像和 `30-bit` 消息。
+
+> 当前仓库不包含训练数据、checkpoint 或最终实验日志。本文只描述代码与正式 YAML 中已经实现的功能，不报告未经复现的 ACC、BER、PSNR、SSIM、LPIPS 或真实屏摄结果。Experimental results will be added after the final evaluation.
+
+## 项目概述
+
+传统的扩散生成从近似纯高斯噪声开始；DiffuBind 的训练与推理都以载体图像为起点：
+
+```text
+cover image
+    -> forward diffusion to t_start
+    -> carrier-conditioned reverse diffusion
+    -> watermarked image
 ```
-cover image + watermark bits → diffusion model → watermarked image
-                                  ↓
-                          mixed 屏摄/投影退化层
-                                  ↓
-                          watermark decoder → recovered bits
+
+因此，本项目的核心不是“从噪声生成一张带水印的新图”，而是 **carrier-anchored / carrier-conditioned reconstruction**：原图既决定反向过程的内容条件，也决定水印空间条件和允许的残差预算。
+
+当前主链路由四部分组成：
+
+1. `WatermarkConditionedUNet`：以 `x_t`、cover 和水印为条件预测扩散噪声；
+2. Content-Aware Binding：从 cover 的边缘与纹理构造 soft mask；
+3. Carrier-Aware Residual Constraint：按内容 mask 限制 `pred_x0 - cover`；
+4. `ResidualMultiScaleWatermarkDecoder`：从 clean 或屏摄退化图像恢复消息。
+
+## 研究动机
+
+跨设备屏摄会同时引入几何、显示、光学、采样和传感器失真。若水印只依赖不受约束的加性扰动，容易在平坦区域形成彩色偏置、条纹或窄带频谱峰；若只追求 clean 解码，又难以覆盖不同设备的退化分布。DiffuBind 因此将以下目标联合起来：
+
+- 以 cover 约束图像内容与整体外观；
+- 将更多水印承载能力分配给边缘和局部纹理；
+- 同时提供 global message conditioning 与 spatial message conditioning；
+- 用可微屏摄近似训练 Decoder，并小幅适配 Encoder；
+- 同时优化平均攻击性能和最差设备性能；
+- 使用固定“设备 × 强度”矩阵稳定选择 checkpoint。
+
+## 方法总览
+
+```text
+Carrier Image
+      |
+      +----------------------> Multi-scale Edge / Texture Analysis
+      |                                      |
+      |                                 Content Mask
+      |                                      |
+      v                                      v
+Forward Diffusion                     Spatial WM Gating
+      |
+      v
+     x_t
+      |
+      +---- Carrier Image
+      +---- Global WM Embedding ----> fused with timestep embedding
+      +---- Spatial WM Map ---------> gated by Content Mask
+      |                                      |
+      +------------------ concat ------------+
+                             |
+                             v
+                    Conditional U-Net
+                             |
+                             v
+                         pred_x0
+                             |
+                             v
+              Carrier-Anchored Residual Constraint
+                             |
+                             v
+                    Watermarked Image
+                      |             |
+                      |       Screen Recapture
+                      |      PIMoG / OLED / LED /
+                      |          Projector
+                      v             v
+                   Decoder       Decoder
+                      |             |
+                      +------v------+
+                             |
+                     Recovered Message
 ```
 
-扩散模型在载体图像条件和水印条件共同引导下，对载体图像进行内容保持的重绘，
-并在重绘过程中嵌入水印信息。训练和采样阶段均采用 image-to-image 范式，
-始终从 cover image 的加噪版本出发，从不使用纯噪声 N(0,I)。
+训练阶段使用低时间步的单步 `pred_x0` 作为可微代理；周期采样、独立采样和合成鲁棒性评估才执行从 `t_start` 到 0 的完整 DDPM 反向轨迹。两类结果不可直接混为一谈。
+
+## 载体锚定扩散
+
+正式配置使用 1000-step linear beta schedule。训练包含两条 U-Net 分支：
+
+- **Diffusion branch**：在完整时间步 `[0, 1000)` 采样 `t_diff`，以 MSE 学习噪声预测；
+- **Watermark branch**：在 `[wm_t_min, wm_t_max) = [0, 200)` 采样 `t_wm`，从预测噪声解析 `pred_x0`，再计算水印与图像约束。
+
+推理时，给 cover 在 `t_start - 1` 处加噪，再逐步执行 `t_start` 次 DDPM reverse update。`t_start` 同时决定前向扰动幅度和实际反向步数；当前正式训练设置为 `train_t_start: 200`。
+
+## 内容感知水印绑定
+
+### 基于载体内容的掩码
+
+`models/watermark_residual.py` 从 `[0,1]` cover 的亮度通道构造内容相关 soft allowance：
+
+1. 在多个尺度计算 Sobel edge response；
+2. 在多个局部窗口计算 local standard deviation；
+3. 分别归一化后按 `edge_weight` / `texture_weight` 融合；
+4. 对每张图使用分位数阈值，使 support area 在不同 cover 之间可比较；
+5. 用 sigmoid 和 `mask_temperature` 得到连续 soft mask。
+
+高 allowance 表示边缘或纹理较丰富、相对适合承载水印；平坦区域 allowance 较低。mask 从 cover 计算并 detach，不反向修改 cover 分析过程。
+
+### 全局—空间双路水印条件
+
+30-bit 消息通过两条条件路径进入 U-Net：
+
+```text
+Global path:
+watermark bits -> watermark_mlp -> 256-D embedding
+               -> add to timestep embedding
+
+Spatial path:
+watermark bits -> watermark_map_mlp -> 4 x 16 x 16 map
+               -> bilinear interpolation to 4 x 128 x 128
+               -> content-aware gating
+```
+
+空间门控为：
+
+```text
+gate = wm_map_flat_floor + (1 - wm_map_flat_floor) * content_mask
+gated_wm_map = wm_map * gate
+```
+
+正式配置同时启用两条路径。U-Net 的空间输入为：
+
+```text
+x_t       : 3 channels
+cover     : 3 channels
+wm_map    : 4 channels
+----------------------
+total     : 10 channels
+```
+
+这不是单一 watermark embedding，而是 **Global + Spatial Dual Watermark Conditioning**。
+
+## 载体感知残差约束
+
+模型从噪声预测恢复候选 `pred_x0` 后，不直接把任意扰动写入 cover。代码先在 `[0,1]` 域计算 raw residual，再按 content allowance 分配空间预算：
+
+```text
+budget = flat_budget
+       + (texture_budget - flat_budget) * allowance^mask_power
+
+bounded_delta = budget * tanh(raw_delta / max(budget, eps))
+watermarked   = clamp(cover + bounded_delta, 0, 1)
+```
+
+等价地，平坦区域只允许很小的残差；边缘和纹理区域可以使用相对更大的预算。平滑 `tanh` 投影在训练和完整 DDPM 嵌入中均可参与约束，避免把水印理解为 unrestricted additive perturbation。
+
+## 水印解码器
+
+正式配置使用 `ResidualMultiScaleWatermarkDecoder`：
+
+```text
+RGB image [-1,1]
+    -> stem: Conv / GroupNorm / SiLU
+    -> residual blocks + stride-2 downsampling
+    -> 32x32, 16x16, 8x8 feature maps
+    -> global average pooling at three scales
+    -> feature concatenation
+    -> Linear / SiLU / Dropout / Linear
+    -> 30 raw logits
+```
+
+Decoder 内部不使用 sigmoid，也不做图像归一化：
+
+- 训练：`BCEWithLogitsLoss(logits, bits)`；
+- 推理：`sigmoid(logits) > 0.5`。
+
+仓库保留 `decoder.type: simple` 作为兼容/消融入口，但两份正式 YAML 都使用 `residual_multiscale`。
+
+## 跨设备屏摄退化模拟
+
+所有正式 Noise Layer 均使用统一的 `[0,1] -> [0,1]` 接口，并在 FP32 中执行。
+
+### PIMoG / LCD 类屏幕
+
+`PIMoGLayer` 保留 PIMoG 风格的 perspective、illumination、moiré 与 Gaussian noise 链路。内部历史实现使用 `[-1,1]`；adapter 负责从统一 `[0,1]` 输入转换到旧范围，再把输出转换回 `[0,1]`。
+
+### OLED 屏幕
+
+当前 OLED 链路包含：
+
+- OLED tone response、gamma、contrast、saturation 与 highlight/black response；
+- PenTile 或 stripe subpixel pattern；
+- subpixel emission spread、display blur 与 camera blur；
+- perspective；
+- PWM / rolling-shutter banding；
+- viewing-angle color shift；
+- signal-dependent sensor noise 与 Gaussian noise；
+- motion blur；
+- reflection / haze；
+- optional resampling 与 differentiable JPEG proxy。
+
+正式 Stage 2 配置关闭 `enable_resample` 和 `use_jpeg`，其余列出的主模块按各自开关与概率运行。
+
+### LED 大屏
+
+当前 LED 链路包含：
+
+- low effective resolution / downsampling；
+- LED bead / pixel-grid structure；
+- RGB triplet 或 mono-dot emission；
+- bloom 与亮度/颜色变化；
+- scanline；
+- moiré；
+- perspective；
+- camera blur、resampling 与 sensor noise。
+
+正式配置使用 `severity: medium`、`rgb_triplet` 与 Gaussian dot，并启用 scanline、moiré 和 perspective。
+
+### 投影设备
+
+当前 Projector 链路是受 projector-camera forward modeling / DeProCams 思路启发的轻量可微近似，不能视为 DeProCams 的等价实现。它可模拟：
+
+- projector gamma；
+- radial brightness falloff 与 hotspot；
+- projection surface texture；
+- spatially varying defocus；
+- keystone / perspective；
+- ambient light 与 contrast reduction；
+- color gain / bias；
+- camera sensor noise；
+- optional pixel grid、moiré 与 lens distortion。
+
+正式 Stage 2 配置关闭 pixel grid、moiré 和 lens distortion。
+
+### 张量数值范围
+
+这是不可省略的工程边界：
+
+```text
+Diffusion model / Decoder : [-1,1]
+Noise Layer               : [0,1]
+
+pred_x0 [-1,1]
+    -> (x + 1) / 2
+    -> degradation [0,1]
+    -> 2x - 1
+    -> Decoder [-1,1]
+```
+
+## 训练目标
+
+训练目标不是简单罗列多个 loss，而是分别约束通信、保真、定位与结构伪影：
+
+| 目标 | 作用 |
+|---|---|
+| diffusion noise MSE | 约束完整时间步的扩散噪声预测，避免模型只适配低时间步水印分支 |
+| image L1 | 约束 `pred_x0` 与 cover 的整体保真度 |
+| clean watermark BCE | 建立并保持未退化图像上的消息写入/读取通道 |
+| degraded watermark BCE | 使消息经过屏摄近似后仍可恢复 |
+| delta / TV / top-k residual terms | 分别约束残差幅度、局部高频变化和稀疏尖峰；正式配置中部分权重为 0，仅保留实现与日志 |
+| channel balance | 惩罚 RGB 通道残差能量标准差，抑制 green/purple 等单通道偏置 |
+| region energy-ratio loss | 要求残差能量集中于 cover-derived edge/texture support，并限制 support 外能量 |
+| spectral peak loss | 抑制少数窄带 FFT 峰值 |
+| directional anisotropy loss | 抑制过强水平/垂直方向性条纹 |
+| multi-attack mean/worst BCE | 同时覆盖平均鲁棒性与最差设备鲁棒性 |
+
+`cross_image_correlation`、FFT mid-band ratio、inside/outside energy ratio 等还会作为 validation diagnostics 记录；其中 cross-image correlation 当前是诊断指标，不直接进入 loss。
+
+## 训练策略
+
+### 第一阶段：干净图像上的载体绑定
+
+配置：`configs/watermark_stage1.yaml`
+
+Stage 1 使用 `noise_layer.type: none`，完整训练 Encoder 与 Decoder。它由三个手动阶段组成，必须依次执行 `warmup -> balance -> full`。当前提交的 YAML 是 `train.stage: full`，因此首次从零训练前必须先改为 `warmup`；`balance` 和 `full` 必须从前一阶段 checkpoint 通过 `--init_from` 初始化。
+
+| 阶段 | 作用 | `wm_map_flat_floor` | flat / texture budget | `mask_power` | mask support / temperature | inside / outside target | spectral |
+|---|---|---:|---:|---:|---:|---:|---|
+| Warmup | 建立 clean watermark communication，让 Encoder 学会写入、Decoder 学会读取 | 0.20 | 0.012 / 0.060 | 1.0 | 0.30 / 0.05 | 0.80 / 0.20 | off |
+| Balance | 提高画质、收紧空间预算、加强 edge/texture localization | 0.10 | 0.007 / 0.050 | 1.6 | 0.27 / 0.04 | 0.82 / 0.18 | step 2000 起 warmup |
+| Full | 联合优化 clean ACC、carrier anchoring、RGB balance、方向与 FFT 伪影 | 0.03 | 0.003 / 0.040 | 2.8 | 0.24 / 0.03 | 0.85 / 0.15 | 从 step 0 开启 |
+
+不同阶段的 edge/texture 尺度与融合权重：
+
+| 阶段 | edge scales | texture scales | edge / texture weight |
+|---|---|---|---:|
+| Warmup | `[1,3,5]` | `[3,5,7]` | 0.55 / 0.45 |
+| Balance | `[1,3]` | `[3,5]` | 0.65 / 0.35 |
+| Full | `[1,3]` | `[3,5]` | 0.70 / 0.30 |
+
+Warmup 使用固定主权重：
+
+```text
+lambda_diff=.01, lambda_img=.1, lambda_wm=20, lambda_region=.10
+```
+
+Balance 的 loss schedule 为：
+
+| global step | `lambda_diff` | `lambda_img` | `lambda_wm` | `lambda_region` |
+|---:|---:|---:|---:|---:|
+| 0–2999 | 0.01 | 0.1 | 20 | 0.20 |
+| 3000–5499 | 0.05 | 0.5 | 12 | 0.35 |
+| 5500+ | 0.10 | 1.0 | 8 | 0.50 |
+
+Full 使用：
+
+```text
+lambda_diff=.3, lambda_img=3, lambda_wm=3, lambda_delta=.05,
+lambda_channel=.2, lambda_region=.5
+```
+
+### 第二阶段：跨设备鲁棒性训练
+
+配置：`configs/watermark_stage2.yaml`
+
+Stage 2 的目的不是重新学习一套水印嵌入，而是在尽量保留 Stage 1 carrier-anchored structure 的基础上增强跨设备屏摄鲁棒性。新实验必须用 `--init_from` 从 Stage 1 Full checkpoint 初始化；它只加载 Encoder/Decoder 权重，并新建 Stage 2 AdamW。`--resume` 仅用于继续同一个已中断的 Stage 2 实验。
+
+当前 partial Encoder fine-tuning 精确解冻：
+
+- `watermark_mlp`；
+- `watermark_map_mlp`（`freeze_watermark_map_mlp: false`，当前允许更新）；
+- U-Net 最后 3 个 `output_blocks`；
+- U-Net 最终 `out`；
+- 完整 Decoder。
+
+Encoder 其余部分冻结并保持 eval mode。基础 Encoder LR 为 `1e-6`，Decoder LR 为 `2e-5`，二者都会乘以当前 curriculum 的 `lr_scale`。
+
+Stage 2 使用比 Stage 1 Full 略宽松的 carrier budget，以容纳鲁棒性适配：
+
+```text
+wm_map_flat_floor       = 0.07
+flat / texture budget  = 0.0035 / 0.050
+mask_power              = 2.1
+edge scales             = [1,3,5,7]
+texture scales          = [3,5,7,9]
+edge / texture weight   = 0.60 / 0.40
+target_mask_area        = 0.31
+mask_temperature        = 0.048
+inside / outside target = 0.80 / 0.20
+```
+
+稳定性设置包括 AMP、`amp_init_scale=1024`、`amp_growth_interval=2000`、`amp_min_scale=1`、恢复时低于 16 则重置 scaler、`max_grad_norm=1.0` 和最多 5 次连续 non-finite 保护。代码会在 forward、gradient 或 optimizer step 出现非有限值时跳过污染更新；连续达到阈值则停止训练，避免保存污染 checkpoint。
+
+Stage 2 还使用三段视觉 loss schedule：
+
+| global step | `lambda_diff` | `lambda_img` | `lambda_channel` | `lambda_region` |
+|---:|---:|---:|---:|---:|
+| 0–5999 | 0.10 | 3.00 | 0.20 | 0.35 |
+| 6000–17999 | 0.10 | 2.75 | 0.20 | 0.30 |
+| 18000+ | 0.10 | 2.50 | 0.15 | 0.275 |
+
+### 七段式退化课程
+
+下表由当前 `train.noise_curriculum` 逐项整理。概率顺序与 candidates 一致。
+
+| Phase / step | candidates | degradation probabilities | `apply_prob` | strength | `lambda_wm_clean` | `lambda_wm_degraded` | detach degraded from model | `lr_scale` |
+|---|---|---|---:|---:|---:|---:|---|---:|
+| 1 / 0–1999 | Projector, OLED | 0.50, 0.50 | 0.30 | 0.25 | 1.00 | 0.50 | true | 0.50 |
+| 2 / 2000–5999 | Projector, OLED, PIMoG | 0.35, 0.35, 0.30 | 0.50 | 0.40 | 0.90 | 1.00 | false | 0.75 |
+| 3 / 6000–11999 | PIMoG, OLED, LED, Projector | 0.30, 0.20, 0.35, 0.15 | 0.70 | 0.60 | 0.75 | 1.50 | false | 1.00 |
+| 4 / 12000–17999 | PIMoG, OLED, LED, Projector | 0.33, 0.15, 0.37, 0.15 | 0.85 | 0.75 | 0.60 | 1.50 | false | 1.00 |
+| 5 / 18000–23999 | PIMoG, OLED, LED, Projector | 0.35, 0.10, 0.40, 0.15 | 1.00 | 0.90 | 0.50 | 1.75 | false | 1.00 |
+| 6 / 24000–27999 | PIMoG, OLED, LED, Projector | 0.35, 0.10, 0.40, 0.15 | 1.00 | 1.00 | 0.40 | 2.00 | false | 1.00 |
+| 7 / 28000+ | PIMoG, OLED, LED, Projector | 0.35, 0.10, 0.40, 0.15 | 1.00 | 0.95 | 0.40 | 1.75 | false | 0.50 |
+
+Phase 1 的 detach 只切断 degraded 分支经退化回到 Encoder 的梯度；clean watermark 分支仍可训练当前解冻的 Encoder 参数。
+
+## 多攻击鲁棒优化
+
+Stage 2 启用：
+
+```yaml
+multi_attack:
+  enabled: true
+  attacks_per_batch: 4
+  lambda_mean: 0.30
+  lambda_worst: 0.70
+```
+
+同一个 `pred_x0` 会在一次 batch 中分别接受多个不同退化。候选攻击不放回采样，实际数量为 `min(attacks_per_batch, 当前候选数)`，所以 Phase 1/2/3–7 分别最多执行 2/3/4 个攻击。degraded watermark loss 为：
+
+```text
+L_degraded = 0.30 * mean(L_attack_i)
+           + 0.70 * max(L_attack_i)
+```
+
+这兼顾 average robustness 与 worst-device robustness。
+
+不要混淆两个概念：
+
+- `MixedNoiseLayer.forward()`：一次调用只为整个 batch 选择一种 degradation；
+- `multi_attack`：对同一 watermarked image 多次调用指定的不同 degradation，再聚合 loss。
+
+## 验证与检查点选择
+
+训练期 validation 使用固定消息与 RNG，在低时间步生成 **single-step `pred_x0` surrogate**，而不是运行完整 200-step DDPM embedding。它同时记录：
+
+- clean bit ACC 与 BCE；
+- curriculum 强度下的 per-device ACC、BCE、SSIM；
+- macro degraded ACC、worst-device ACC；
+- watermarked PSNR、SSIM、MAE；
+- top-k residual、TV、RGB channel imbalance；
+- mask area、inside/outside energy ratio；
+- directional ratio、FFT peak/mid-band ratio、cross-image correlation。
+
+Stage 2 每个 validation epoch 还运行固定矩阵：
+
+```text
+{PIMoG, OLED, LED, Projector}
+    x
+{0.55, 0.70, 0.85, 1.00}
+```
+
+每个 cell 使用与 epoch 无关的固定 RNG stream，最多覆盖 16 个 validation batches。`use_fixed_matrix_for_checkpoint: true`，因此 checkpoint 比较使用固定矩阵的 macro ACC、worst-cell ACC 和 macro BCE，而不是某一次随机 mixed attack。
+
+当前 `balanced_score_v1_fixed_matrix` 为：
+
+```text
+0.40 * degraded_macro_acc
++ 0.25 * degraded_worst_acc
++ 0.10 * clean_acc
++ 0.05 * exp(-degraded_macro_bce)
++ 0.10 * normalized_psnr(30 dB, 45 dB)
++ 0.10 * residual_quality(top-k, TV, channel balance)
+```
+
+其中 residual quality 是三个归一化分数的均值：`1-clamp(topk/0.10)`、`1-clamp(TV/0.05)` 与 `1-clamp(channel_std/0.02)`。
+
+SSIM 和其他结构指标会记录到日志/checkpoint，但不直接进入该 score。训练会保存：
+
+- `latest.pt`：按 `save_interval` 保存，用于恢复；
+- `best_degradation_stage*.pt`：按当前候选退化集合分组的阶段最佳；
+- `best.pt`：当前 degradation-stage 最佳的镜像；
+- `final.pt`：最后一轮权重与最近一次 validation metadata。
+
+正式报告仍应使用 `eval_watermark_robustness.py` 的完整多步嵌入重新比较候选 checkpoint，不能把 single-step validation 当作最终部署性能。
 
 ## 项目结构
 
-```
-guided_diffusion/          # 精简版 guided-diffusion（UNet + 扩散过程）
-dataset/                   # 数据集加载（支持 max_images 限制）
-models/                    # 条件 U-Net、水印解码器
-NOISE_LAYER/               # 统一退化层（PIMoG、OLED、LED、Projector、Mixed）
-configs/                   # YAML 配置文件
-train_watermark_diffusion.py    # 训练脚本
-sample_embed_watermark.py       # 采样/水印嵌入
-eval_watermark_robustness.py    # 鲁棒性评估
+```text
+DiffuBind/
+|-- configs/
+|   |-- watermark_stage1.yaml       # clean Warmup/Balance/Full
+|   `-- watermark_stage2.yaml       # seven-phase cross-device training
+|-- dataset/
+|   `-- watermark_image_dataset.py  # resize/crop and validation messages
+|-- guided_diffusion/               # DDPM schedule and U-Net backbone
+|-- models/
+|   |-- watermark_unet.py           # carrier + global/spatial WM conditions
+|   |-- watermark_residual.py       # content mask and residual projection
+|   `-- watermark_decoder.py        # residual multi-scale Decoder
+|-- NOISE_LAYER/
+|   |-- build_noise_layer.py        # factory and MixedNoiseLayer
+|   |-- PIMoG_Layer.py
+|   |-- OLED_Layer.py
+|   |-- LED_Layer.py
+|   `-- Projector_Layer.py
+|-- train_watermark_diffusion.py    # training, validation, checkpointing
+|-- sample_embed_watermark.py       # single/batch full-DDPM embedding
+|-- eval_watermark_robustness.py    # synthetic robustness evaluation
+|-- eval_real_screen.py             # Decoder-only real capture evaluation
+|-- manual_inspection.py            # manual four-corner rectification GUI
+`-- PROJECT_MANUAL.md               # implementation audit notes
 ```
 
-## 快速开始
+`models/screen_simulator.py` 是旧包装器，不属于当前正式训练主链；正式入口统一使用 `NOISE_LAYER/build_noise_layer.py`。
 
-### 1. 安装环境
+## 运行环境
+
+项目约定使用 Conda 环境 `wadiff`。下文 Linux 示例假设解释器位于 `/root/miniconda3/envs/wadiff/bin/python`；如果安装位置不同，请替换为本机 `wadiff` 环境的实际 Python 路径。
+
+Windows 工作区的解释器为：
+
+```text
+D:\Anaconda_envs\envs\wadiff\python.exe
+```
+
+Windows 安装核心依赖：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" -m pip install -r requirements.txt
+```
+
+Linux 安装核心依赖：
 
 ```bash
-conda create -n wadiff python=3.10 -y
-conda activate wadiff
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install -r requirements.txt
+/root/miniconda3/envs/wadiff/bin/python -m pip install -r requirements.txt
 ```
 
-### 2. 准备数据
+`requirements.txt` 包含核心训练依赖。附加功能需要按用途安装：
 
-COCO 2017 数据集目录结构：
+- `manual_inspection.py`：`opencv-python`，以及系统可用的 Tk；
+- `eval_watermark_robustness.py --enable_lpips`：可选 `lpips`；
+- 部分 `tools/` 诊断脚本可能还需要 `matplotlib` 或 `tqdm`。
 
+## 数据集
+
+正式配置默认指向 COCO 2017 风格目录：
+
+```text
+/root/autodl-tmp/datasets/
+|-- train2017/
+`-- val2017/
 ```
-/path/to/datasets/
-  train2017/
-    000000000009.jpg
-    ...
-  val2017/
-    000000000139.jpg
-    ...
+
+在 `configs/watermark_stage1.yaml` 和 `configs/watermark_stage2.yaml` 中修改：
+
+```yaml
+data:
+  train_dir: /path/to/train2017
+  val_dir: /path/to/val2017
 ```
 
----
+预处理保持长宽比：`Resize(shorter_edge=128)` 后，训练使用 `RandomCrop(128)`，验证使用 `CenterCrop(128)`，最后归一化到 `[-1,1]`。
 
-## 当前正式训练流程：Stage 1 → Stage 2
+数据发现逻辑并非完全递归：优先查找根目录的 PNG；没有 PNG 时查找根目录 JPG，再查找 JPEG，最后只回退到一层子目录 PNG。建议把同一数据集统一放在配置目录的当前层，避免扩展名优先级导致漏读。
 
-项目现在只使用两个正式训练阶段：
+## 训练命令
 
-~~~text
-Stage 1（无退化）
-  warmup → balance → full，三个子阶段手动切换
-  学习clean水印嵌入、提取、严格纹理定位和图像质量
-                    ↓
-Stage 2（有退化）
-  从Stage 1 full的latest.pt初始化
-  学习PIMoG/OLED/LED/Projector屏摄鲁棒性
-~~~
+### 第一阶段
 
-Stage 1.5已从正式流程和配置中移除。
-
----
-
-## Stage 1：clean嵌入与严格纹理定位
-
-正式配置：
-
-~~~text
-configs/watermark_stage1.yaml
-~~~
-
-Stage 1不使用任何屏摄退化：
-
-~~~yaml
-noise_layer:
-  type: none
-~~~
-
-Encoder和Decoder都完整训练。训练目标包括：
-
-- 从cover image和30 bit生成watermarked image；
-- Decoder从clean水印图恢复30 bit；
-- 保持watermarked image与cover的图像质量；
-- Full和Stage 2使用1/3边缘尺度和3/5纹理尺度构造精细内容mask；
-- 将主要残差能量集中到多个边缘/纹理区域；
-- 抑制平坦区域残差、固定横向条纹和窄带频谱峰值。
-
-关键严格纹理参数（top-level为full/Stage 2最终值，warmup和balance
-通过`train.stages`自动使用更宽松的阶段预算）：
-
-~~~yaml
-model:
-  use_content_gated_wm_map: true
-  wm_map_flat_floor: 0.03
-
-train:
-  residual_constraint:
-    enabled: true
-    flat_max_abs_delta_01: 0.003
-    texture_max_abs_delta_01: 0.040
-    mask_power: 2.8
-
-  region_guidance:
-    mode: strict_multiscale
-    loss_mode: energy_ratio
-    edge_scales: [1, 3]
-    texture_scales: [3, 5]
-    edge_weight: 0.70
-    texture_weight: 0.30
-    target_mask_area: 0.24
-    mask_temperature: 0.03
-    start_inside_ratio: 0.65
-    target_inside_ratio: 0.85
-    start_max_outside_ratio: 0.35
-    max_outside_ratio: 0.15
-    ratio_warmup_steps: 5000
-~~~
-
-输出目录：
-
-~~~text
-checkpoints_stage1_strict_texture_30bit_fine_v2
-outputs_stage1_strict_texture_30bit_fine_v2/samples
-outputs_stage1_strict_texture_30bit_fine_v2/logs
-~~~
-
-### Stage 1的三个手动子阶段
-
-当前子阶段由以下字段控制：
-
-~~~yaml
-train:
-  stage: warmup
-~~~
-
-只允许使用warmup、balance或full。阶段名拼错时训练脚本会直接终止。阶段切换必须使用--init_from；同一阶段中断恢复才使用--resume。
-
-#### 1. warmup：建立clean水印通信
-
-warmup重点训练写入和读取水印：
-
-- lambda_wm较高；
-- 使用lambda_diff=0.01维持全时间步扩散数值稳定；
-- 图像约束较轻；
-- 精细位置mask始终生效，但残差预算放宽为flat=0.012、texture=0.060、mask_power=1.0；
-- `wm_map_flat_floor=0.20`，避免随机初始化阶段的bit条件被过早压弱；
-- 纹理定位loss使用较小权重；
-- 频谱正则暂时关闭，避免阻碍初始通信收敛。
-
-配置：
-
-~~~yaml
-train:
-  stage: warmup
-~~~
-
-Linux：
-
-~~~bash
-export OMP_NUM_THREADS=8
-
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage1.yaml
-~~~
+首次训练先把 `train.stage` 改为 `warmup`。
 
 Windows：
 
-~~~powershell
+```powershell
 & "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml
-~~~
+```
 
-建议在以下条件基本满足后进入balance：
+Linux：
 
-- train bit_acc稳定高于0.90；
-- val bit_acc_clean持续上升并明显高于随机值；
-- loss_wm稳定下降；
-- residual没有大面积泄漏到平坦区域。
+```bash
+/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml
+```
 
-#### 2. balance：恢复图像质量并加强纹理定位
+进入 Balance 或 Full 时，修改 `train.stage` 并从前一阶段初始化。
 
-编辑配置：
+Windows：
 
-~~~yaml
-train:
-  stage: balance
-~~~
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\best.pt
+```
 
-balance会分三段调整loss：
+Linux：
 
-| step | lambda_diff | lambda_img | lambda_wm | lambda_region |
-|---:|---:|---:|---:|---:|
-| 0–2999 | 0.01 | 0.1 | 20.0 | 0.20 |
-| 3000–5499 | 0.05 | 0.5 | 12.0 | 0.35 |
-| 5500+ | 0.1 | 1.0 | 8.0 | 0.50 |
-
-balance自动把残差预算收紧为flat=0.007、texture=0.050、mask_power=1.6，
-并使用`wm_map_flat_floor=0.10`；引导支持区域从Warmup的30%收紧到27%，
-同时从step 2000开始逐渐启用轻量方向和频谱约束。
-
-~~~bash
-python train_watermark_diffusion.py \
+```bash
+/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
   --config configs/watermark_stage1.yaml \
   --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/best.pt
-~~~
+```
 
-#### 3. full：Stage 1最终联合收敛
+同一阶段中断恢复。
 
-编辑配置：
+Windows：
 
-~~~yaml
-train:
-  stage: full
-~~~
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage1.yaml --resume checkpoints_stage1_strict_texture_30bit_fine_v2\latest.pt
+```
 
-full同时优化diffusion噪声预测、clean水印提取、图像保真、RGB残差平衡、纹理能量比例及方向和FFT峰值。
-该阶段使用最终精细引导：edge_scales=[1,3]、texture_scales=[3,5]、
-target_mask_area=0.24、mask_temperature=0.03，并自动恢复最终严格预算
-flat=0.003、texture=0.040、mask_power=2.8和`wm_map_flat_floor=0.03`。
+Linux：
 
-当前主要权重：
-
-~~~yaml
-lambda_diff: 0.3
-lambda_img: 3.0
-lambda_wm: 3.0
-lambda_delta: 0.05
-lambda_channel: 0.2
-lambda_region: 0.5
-~~~
-
-~~~bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage1.yaml \
-  --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/best.pt
-~~~
-
-Stage 1的full阶段完成后，应使用通过多步嵌入检查的checkpoint。当前实验在Full指标
-收敛后提前结束，因此Stage 2初始化保护指定为`latest.pt`。
-
-### Stage 1中断恢复
-
-保持当前train.stage不变：
-
-~~~bash
-python train_watermark_diffusion.py \
+```bash
+/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
   --config configs/watermark_stage1.yaml \
   --resume checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
-~~~
+```
 
-不要用--resume切换warmup、balance和full；切换阶段时使用--init_from。
+### 第二阶段
 
-### Stage 1重点指标
-
-| 指标 | 建议目标 |
-|---|---:|
-| clean ACC | ≥0.98 |
-| mask_area_ratio | 0.25–0.45 |
-| inside_energy_ratio | ≥0.80，最终接近0.85 |
-| outside_energy_ratio | ≤0.20 |
-| directional_ratio | 尽量低于2 |
-| PSNR变化 | 相比高画质基线不应明显下降 |
-| 残差图 | 平坦区接近无信号，无跨图重复横纹 |
-
----
-
-## Stage 2：mixed屏摄鲁棒训练
-
-正式配置：
-
-~~~text
-configs/watermark_stage2.yaml
-~~~
-
-Stage 2只能从当前选定的Stage 1 Full checkpoint开始：
-
-~~~text
-checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
-~~~
-
-训练脚本会拒绝无--init_from的新Stage 2运行，也会拒绝不符合配置要求的初始化路径。
-
-### Stage 2训练重点
-
-- Decoder完整训练，学习从屏摄退化图中恢复30 bit；
-- Encoder只部分解冻，学习率为1e-6；
-- Decoder学习率为2e-5；
-- watermark_map_mlp保持冻结；
-- 同一watermarked image每批训练两个不同退化；
-- degraded loss使用mean + worst-case；
-- 与Stage 1 Full完全一致地保持24%精细纹理mask、0.003/0.040区域残差预算、
-  `mask_power=2.8`和`wm_map_flat_floor=0.03`；
-- 继续保持Stage 1 Full的纹理内外能量目标和频谱约束；
-- 使用固定4种退化×4种强度矩阵选择checkpoint。
-
-| 退化 | 主要模拟内容 |
-|---|---|
-| PIMoG | 透视、光照、摩尔纹和噪声 |
-| OLED | 子像素、显示模糊、频闪、反射和颜色变化 |
-| LED | 降采样、灯珠/像素网格、scanline、摩尔纹和透视 |
-| Projector | gamma、亮度衰减、热点、环境光、模糊和透视 |
-
-### 退化课程
-
-| phase | step范围 | candidates | strength | apply_prob | lambda degraded |
-|---:|---:|---|---:|---:|---:|
-| 1 | 0–1999 | Projector, OLED | 0.25 | 0.30 | 0.50 |
-| 2 | 2000–5999 | Projector, OLED, PIMoG | 0.40 | 0.50 | 1.00 |
-| 3 | 6000–13999 | 四种退化 | 0.55 | 0.70 | 1.50 |
-| 4 | 14000–21999 | 四种退化 | 0.70 | 0.80 | 1.25 |
-| 5 | 22000–27999 | 四种退化 | 0.85 | 0.90 | 1.00 |
-| 6 | 28000+ | 四种退化 | 1.00 | 0.90 | 1.00 |
-
-Phase 1的degraded分支对Encoder执行detach，主要让Decoder先适应温和退化；Phase 2之后才允许退化水印损失小幅更新部分Encoder。
-
-### 启动Stage 2
-
-Linux：
-
-~~~bash
-export OMP_NUM_THREADS=8
-
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage2.yaml \
-  --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/latest.pt
-~~~
+从 Stage 1 Full checkpoint 开始新的 Stage 2。
 
 Windows：
 
-~~~powershell
-& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage2.yaml --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\latest.pt
-~~~
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage2.yaml --init_from checkpoints_stage1_strict_texture_30bit_fine_v2\best.pt
+```
 
-输出目录：
-
-~~~text
-checkpoints_stage2_one_shot_relaxed_v1
-outputs_stage2_one_shot_relaxed_v1/samples
-outputs_stage2_one_shot_relaxed_v1/logs
-~~~
-
-### Stage 2中断恢复
-
-~~~bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage2.yaml \
-  --resume checkpoints_stage2_one_shot_relaxed_v1/latest.pt
-~~~
-
-恢复时不要再传--init_from。
-
-### Stage 2日志与checkpoint
-
-- train_log.csv：loss、clean/degraded ACC、实际退化、强度、梯度和残差结构；
-- val_log.csv：clean和逐退化ACC、PSNR、纹理定位、频谱与综合评分；
-- val_fixed_matrix.csv：固定退化/强度矩阵；
-- sample_log.csv：完整多步嵌入样本的ACC和视觉指标。
-
-| checkpoint | 用途 |
-|---|---|
-| best.pt | 当前固定矩阵综合评分最佳 |
-| best_degradation_stage*.pt | 相同退化集合内的阶段最佳 |
-| latest.pt | 中断恢复 |
-| final.pt | 最后一轮权重 |
-
-最终报告应同时比较best.pt、latest.pt和final.pt，并使用真正的多步嵌入评估。
-
----
-
-## 采样（生成带水印图）
+Linux：
 
 ```bash
-# 基础采样（随机水印）
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
-  --input ./test_images/test.png \
-  --output ./outputs_stage2_one_shot_relaxed_v1/watermarked.png \
-  --t_start 200
-
-# 指定水印内容
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
-  --input ./test_images/test.png \
-  --watermark "101100101011001010110010101100" \
-  --output ./outputs_stage2_one_shot_relaxed_v1/watermarked_fixed_bits.png \
-  --t_start 200
-
-# 同时保存固定退化版本，便于区分 mixed 训练后的不同屏摄退化
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
+/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
   --config configs/watermark_stage2.yaml \
+  --init_from checkpoints_stage1_strict_texture_30bit_fine_v2/best.pt
+```
+
+当前配置只要求新 Stage 2 提供某个 `--init_from`；`expected_init_from` 仍是注释，不会强制具体文件名。请自行确保它确实来自结构匹配的 Stage 1 Full。
+
+恢复同一个 Stage 2。
+
+Windows：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" train_watermark_diffusion.py --config configs\watermark_stage2.yaml --resume checkpoints_stage2_one_shot_relaxed_v1\latest.pt
+```
+
+Linux：
+
+```bash
+/root/miniconda3/envs/wadiff/bin/python train_watermark_diffusion.py \
+  --config configs/watermark_stage2.yaml \
+  --resume checkpoints_stage2_one_shot_relaxed_v1/latest.pt
+```
+
+`--resume` 与 `--init_from` 互斥：前者恢复模型、Decoder、optimizer、AMP scaler、step 与 RNG；后者只初始化模型/Decoder，并从新 optimizer 和 `global_step=0` 开始。
+
+## 水印嵌入与采样
+
+`sample_embed_watermark.py` 执行正式 image-to-image DDPM embedding，支持：
+
+- 单张图片或目录当前层的非递归批处理；
+- 随机水印或 `--watermark` 指定的二进制字符串；
+- clean decoding；
+- 指定单一/mixed degradation 后的 decoding；
+- `--save_degraded` 导出固定 PIMoG/OLED/LED/Projector 版本；
+- cover/watermarked comparison、degraded grid 和批量 CSV。
+
+单图示例（Windows）：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" sample_embed_watermark.py `
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+  --config configs\watermark_stage2.yaml `
+  --input test_images\test.png `
+  --watermark "101100101011001010110010101100" `
+  --output outputs_stage2_one_shot_relaxed_v1\watermarked.png `
+  --t_start 200
+```
+
+单图示例（Linux）：
+
+```bash
+/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
   --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
-  --input ./test_images/test.png \
-  --output ./outputs_stage2_one_shot_relaxed_v1/watermarked_with_degradations.png \
+  --config configs/watermark_stage2.yaml \
+  --input test_images/test.png \
+  --watermark "101100101011001010110010101100" \
+  --output outputs_stage2_one_shot_relaxed_v1/watermarked.png \
+  --t_start 200
+```
+
+目录批处理并导出固定退化（Windows）：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" sample_embed_watermark.py `
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+  --config configs\watermark_stage2.yaml `
+  --input test_images `
+  --output outputs_stage2_one_shot_relaxed_v1\watermarked_batch `
+  --t_start 200 `
+  --noise_layer mixed `
+  --save_degraded `
+  --degradation_types pimog,oled,led,projector
+```
+
+目录批处理并导出固定退化（Linux）：
+
+```bash
+/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+  --config configs/watermark_stage2.yaml \
+  --input test_images \
+  --output outputs_stage2_one_shot_relaxed_v1/watermarked_batch \
   --t_start 200 \
   --noise_layer mixed \
   --save_degraded \
   --degradation_types pimog,oled,led,projector
 ```
 
-当前 Stage 2 的水印长度为 30 bit。输入位数不足时会自动补 0，超出时会按照 checkpoint
-配置截断。
-采样始终输出 `bit_acc_clean`。只有指定了实际噪声层时才计算
-`bit_acc_degraded`；默认 `--noise_layer none` 时日志显示
-`bit_acc_degraded=N/A (not evaluated)`，避免把同一张 clean 水印图的重复解码
-误认为退化鲁棒性。传入 `--save_degraded` 时，会把退化图、
-cover/watermarked/degraded/residual grid，以及固定退化版本保存到输出目录下的
-`degraded/` 子目录。
+注意：
 
----
+- CLI 默认 `--t_start 300`，但正式训练配置为 200；可比实验必须显式传入 `--t_start 200`；
+- YAML 中的 `diffusion.sample_steps: 100` 当前没有被采样代码读取，不控制 reverse steps；
+- 实际采样步数完全由 `--t_start` 决定；
+- 指定消息不足 30 bit 时补 0，超过时截断；不指定消息时随机生成；
+- 目录模式对 checkpoint、模型和 Decoder 只加载一次，但同一次运行中的所有图片共享同一组消息 bits。
 
-## 真实世界屏摄实验（Linux/AutoDL）
+## 合成退化鲁棒性评测
 
-下面的命令均在项目根目录下执行，可以直接复制运行。实验使用固定的 30-bit
-水印 `101100101011001010110010101100`，生成和解码时必须保持一致。
+`eval_watermark_robustness.py` 先对固定验证子集执行完整 DDPM embedding，再分别应用 clean/PIMoG/OLED/LED/Projector/mixed 退化。
 
-### 1. 创建实验目录
+Windows：
 
-```bash
-mkdir -p ./outputs_stage2_one_shot_relaxed_v1/real_world
-mkdir -p ./real_screen_photos
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" eval_watermark_robustness.py `
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+  --config configs\watermark_stage2.yaml `
+  --noise_layers clean,pimog,oled,led,projector `
+  --t_start 200 `
+  --batch_size 8 `
+  --seed 42 `
+  --num_eval_images 500 `
+  --subset_seed 42 `
+  --num_visual_samples 16 `
+  --noise_strength 1.0 `
+  --attack_repeats 1 `
+  --output outputs_stage2_one_shot_relaxed_v1\eval_results_500.csv
 ```
 
-### 2. 生成带水印图片
-
-#### 单张图片
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
-  --input ./test_images/test.png \
-  --watermark "101100101011001010110010101100" \
-  --output ./outputs_stage2_one_shot_relaxed_v1/real_world/watermarked.png \
-  --t_start 200 \
-  --device cuda
-```
-
-命令执行完成后，用于真实屏摄的图片为：
-
-```text
-outputs_stage2_one_shot_relaxed_v1/real_world/watermarked.png
-```
-
-将这张图片全屏显示在显示器、OLED、LED 或投影设备上，然后使用手机或相机拍摄。
-不要拍摄 `comparison/` 目录中的对比图，也不要使用 `degraded/` 目录中的模拟退化图。
-
-#### 目录中的全部图片（非递归）
-
-如果 `test_images/` 中有多张图片，可以直接把目录传给 `--input`。`--output`
-此时必须是输出目录：
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
-  --input ./test_images \
-  --watermark "101100101011001010110010101100" \
-  --output ./outputs_stage2_one_shot_relaxed_v1/real_world/watermarked_batch \
-  --t_start 200 \
-  --device cuda
-```
-
-该命令只处理 `test_images/` 当前层中的 `.jpg`、`.jpeg`、`.png` 和 `.bmp`
-文件，不进入子目录。checkpoint、扩散模型和 decoder 只加载一次，所有图片使用
-同一个固定水印并依次处理，不会一次性把全部图片放入显存。
-
-假设输入目录为：
-
-```text
-test_images/
-├── image001.jpg
-├── image002.png
-└── image003.bmp
-```
-
-主要输出为：
-
-```text
-outputs_stage2_one_shot_relaxed_v1/real_world/watermarked_batch/
-├── image001_watermarked.png
-├── image002_watermarked.png
-├── image003_watermarked.png
-├── batch_embed_results.csv
-└── comparison/
-    ├── image001_watermarked_comparison.png
-    ├── image002_watermarked_comparison.png
-    └── image003_watermarked_comparison.png
-```
-
-输出统一使用无损 PNG。`batch_embed_results.csv` 保存每张图片的输入路径、输出
-路径、clean/degraded bit accuracy、处理状态和错误信息。当
-`--noise_layer none` 时，CSV 的 `bit_acc_degraded` 单元格留空，表示未执行退化
-评估；只有实际指定噪声层时该列才写入数值。如果某张图片读取失败，脚本会记录
-错误并继续处理剩余图片，最后返回非零退出码以提示批次中存在失败项。
-
-输入输出参数兼容以下形式：
-
-| `--input` | `--output` | 行为 |
-|---|---|---|
-| 图片文件 | 图片文件 | 使用指定输出文件名，保持原有单图行为 |
-| 图片文件 | 目录 | 自动保存为 `<原文件名>_watermarked.png` |
-| 目录 | 目录 | 非递归处理目录当前层中的所有支持图片 |
-| 目录 | 图片文件 | 报错，避免多张结果覆盖同一个文件 |
-
-目录批量模式下，输入目录和输出目录不能相同。
-
-### 3. 准备真实拍摄照片
-
-将真实拍摄的图片上传到项目的 `real_screen_photos/` 目录，例如：
-
-```text
-real_screen_photos/
-├── monitor_front_01.jpg
-├── monitor_angle_01.jpg
-├── oled_far_01.jpg
-├── led_lowlight_01.jpg
-└── projector_angle_01.jpg
-```
-
-支持 `.jpg`、`.jpeg`、`.png` 和 `.bmp`。运行解码前，建议先完成以下处理：
-
-- 裁掉屏幕边框、桌面 UI、黑边和周围环境；
-- 斜拍照片根据显示区域四角进行透视校正；
-- 只保留屏幕中显示的水印图片区域；
-- 将图片保存为正方形 RGB 图像。
-
-脚本会自动缩放和中心裁剪，不需要手动调整到 `128×128`，但不会自动检测屏幕
-边界或进行透视校正。
-
-### 4. 解码并计算真实屏摄准确率
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python eval_real_screen.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
-  --input_dir ./real_screen_photos \
-  --watermark "101100101011001010110010101100" \
-  --device cuda
-```
-
-脚本会输出每张照片的解码结果、bit accuracy 和所有照片的平均准确率，并将结果
-保存到：
-
-```text
-real_screen_photos/real_screen_results.csv
-```
-
-如果只想输出解码后的水印、不计算准确率，直接运行：
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python eval_real_screen.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
-  --input_dir ./real_screen_photos \
-  --device cuda
-```
-
-同一目录中的照片应使用同一个固定水印。如果不同图片使用了不同水印，需要按照
-水印内容分别放入不同目录并分别执行解码命令。
-
-### 5. 使用其他 checkpoint 对比
-
-例如，使用四种退化全部加入后的综合最佳 checkpoint 重新生成图片：
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best_degradation_stage3.pt \
-  --input ./test_images/test.png \
-  --watermark "101100101011001010110010101100" \
-  --output ./outputs_stage2_one_shot_relaxed_v1/real_world/watermarked_best_stage3.png \
-  --t_start 200 \
-  --device cuda
-```
-
-完成显示、拍摄和照片裁剪后，将对应照片放入单独目录：
-
-```bash
-mkdir -p ./real_screen_photos_best_stage3
-```
-
-然后直接运行：
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python eval_real_screen.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best_degradation_stage3.pt \
-  --input_dir ./real_screen_photos_best_stage3 \
-  --watermark "101100101011001010110010101100" \
-  --device cuda
-```
-
-比较不同 checkpoint 时，每个 checkpoint 都应分别生成带水印图片、进行屏摄并
-使用对应 decoder 解码。仅更换 checkpoint 解码同一张照片，不能代表完整系统性能。
-
----
-
-## 测试噪声层
-
-```bash
-/root/miniconda3/envs/wadiff/bin/python tools/test_noise_layer.py \
-  --input ./tools/test.jpg \
-  --config configs/watermark_stage2.yaml \
-  --image_size 128 \
-  --device cuda
-```
-
----
-
-## 屏摄鲁棒性评估
-
-评估脚本加载已有 checkpoint，在固定验证集上执行完整 DDPM 水印采样，
-不会修改模型权重，也不需要重新训练。扩散模型和 decoder 使用 `[-1,1]`，
-退化层以及 PSNR、SSIM、L1 使用 `[0,1]`。
-
-### 快速固定子集评估
-
-下面的命令从验证集中固定抽取 500 张图。相同的 `subset_seed` 会得到相同
-验证索引，适合比较 `best.pt`、`latest.pt` 和 `final.pt`：
+Linux：
 
 ```bash
 /root/miniconda3/envs/wadiff/bin/python eval_watermark_robustness.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
   --config configs/watermark_stage2.yaml \
   --noise_layers clean,pimog,oled,led,projector \
   --t_start 200 \
@@ -635,149 +712,122 @@ mkdir -p ./real_screen_photos_best_stage3
   --num_visual_samples 16 \
   --noise_strength 1.0 \
   --attack_repeats 1 \
-  --output ./outputs_stage2_one_shot_relaxed_v1/eval_results_500.csv
+  --output outputs_stage2_one_shot_relaxed_v1/eval_results_500.csv
 ```
 
-`t_start=200` 表示每个 batch 执行完整的 200 次 DDPM 反向更新，不是采样
-200 张图片。500 张、batch size 为 8 时约有 63 个 batch；完整 5000 张则
-约有 625 个 batch。
+支持的指标包括：
 
-快速评估可以暂时不加入 `mixed`。`mixed` 不是第五种物理退化，而是根据
-`noise_layer.mixed.probs` 从 PIMoG、OLED、LED、Projector 中随机选择一种。
-具体定位弱项时优先查看四种独立退化。
+- Bit Accuracy、BER、30-bit Message Success Rate；
+- cover -> watermarked：PSNR、SSIM、L1、optional LPIPS；
+- watermarked -> degraded：attack PSNR、SSIM、L1；
+- cover -> degraded：end-to-end PSNR、SSIM、L1；
+- per-device aggregate、percentile/minimum 与 per-image rows。
 
-### 完整验证集评估
+输出包括 summary CSV、`*_by_noise.csv`、`*_per_image.csv`、metadata JSON、固定 subset indices 和 comparison images。`attack_repeats` 只重复相对便宜的退化与 Decoder，不重复 DDPM embedding。`num_eval_images=0` 表示完整验证集。
 
-`num_eval_images=0` 表示使用完整验证集。最终报告可以增加随机攻击重复次数；
-同一张水印图只做一次 200-step 采样，`attack_repeats` 只重复相对便宜的
-退化层和 decoder：
+## 真实屏摄评测
+
+### 人工透视矫正
+
+`manual_inspection.py` 是 Tk/OpenCV GUI。它递归收集 `real_screen_photos/` 下的图片，允许在原始照片上手工选择显示区域四角，执行 perspective rectification，并把结果保存到 `real_screen_photos/rectified/`。该脚本只做人工检查与几何矫正，不做水印解码。
+
+Windows：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" manual_inspection.py
+```
+
+Linux：
 
 ```bash
-/root/miniconda3/envs/wadiff/bin/python eval_watermark_robustness.py \
-  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/final.pt \
-  --config configs/watermark_stage2.yaml \
-  --noise_layers clean,pimog,oled,led,projector,mixed \
-  --t_start 200 \
-  --batch_size 8 \
-  --seed 42 \
-  --num_eval_images 0 \
-  --subset_seed 42 \
-  --num_visual_samples 16 \
-  --noise_strength 1.0 \
-  --attack_repeats 3 \
-  --output ./outputs_stage2_one_shot_relaxed_v1/eval_results_full.csv
+/root/miniconda3/envs/wadiff/bin/python manual_inspection.py
 ```
 
-不要仅为了加速把 `t_start=200` 改成 50；这会改变采样任务，结果不能与
-200-step 指标直接比较。显存允许时可以尝试提高 `batch_size`。
+### 仅使用解码器的真实屏摄评测
 
-### 退化强度
-
-`noise_strength` 使用与训练相同的线性混合定义：
-
-```python
-degraded_01 = watermarked_01 + noise_strength * (
-    full_degraded_01 - watermarked_01
-)
-```
-
-- `--noise_strength 1.0`：完整退化，适合最终鲁棒性评估；
-- `--noise_strength 0.55/0.70/0.85`：与对应中间课程阶段对齐；
-- `clean` 分支不施加退化，强度固定记为 0。
-
-当前 Stage 2 最后一个课程阶段本身已经是 `strength=1.0`，因此 `final.pt` 的课程强度
-与完整强度相同。评估中间阶段 checkpoint 时，建议同时保留对应课程强度与
-`1.0` 完整强度结果，并在文件名中注明强度。
-
-### 指标口径
-
-脚本逐图计算并汇总：
-
-| 类别 | 比较对象 | 指标 |
-|------|------|------|
-| 水印不可见性 | cover ↔ watermarked | PSNR、SSIM、L1，可选 LPIPS |
-| 攻击强度 | watermarked ↔ degraded | PSNR、SSIM、L1 |
-| 完整链路 | cover ↔ degraded | PSNR、SSIM、L1 |
-| 水印提取 | target bits ↔ decoded bits | bit ACC、BER、30-bit message success |
-
-每种退化输出 `bit_acc_mean`、`bit_acc_p5`、`bit_acc_min`、
-`message_success_rate`。完整消息成功要求一张图的 30 bit 全部正确。
-
-LPIPS 默认关闭，只有 WaDiff 环境已经安装可选的 `lpips` 包时才使用：
-
-```bash
---enable_lpips
-```
-
-脚本不会自动安装依赖；未安装时不要传入该参数。
-
-### 输出文件
-
-以 `--output ./outputs_stage2_one_shot_relaxed_v1/eval_results_500.csv` 为例，会生成：
+`eval_real_screen.py` 只加载 checkpoint 中的 Decoder：
 
 ```text
-outputs_stage2_one_shot_relaxed_v1/
-├── eval_results_500.csv
-├── eval_results_500_by_noise.csv
-├── eval_results_500_per_image.csv
-├── eval_results_500_metadata.json
-├── eval_results_500_indices.txt
-└── eval_results_500_samples/
-    ├── 0000_comparison.png
-    ├── 0001_comparison.png
-    └── ...
+real captured image
+    -> aspect-ratio-preserving resize
+    -> center crop
+    -> normalize to [-1,1]
+    -> Decoder
+    -> sigmoid(logits) > 0.5
+    -> recovered bits
 ```
 
-- 主 CSV 保留 `metric,value` 格式；
-- `by_noise.csv` 每行对应一种退化；
-- `per_image.csv` 保存真正的逐图指标，不再复制 batch PSNR；
-- metadata 保存 checkpoint、seed、强度、步数和实验状态；
-- indices 保存实际使用的原验证集索引；
-- 每个 comparison PNG 将同一张图的 cover、watermarked、各退化和
-  `signed residual ×5` 放在一张图上。
+它不会重新运行 diffusion embedding。预先生成并显示水印图、完成真实拍摄和必要的透视矫正后，再执行。
 
-对比图直接复用计算 ACC 时的退化 tensor，不会为了保存图片重新随机攻击。
-默认只保存综合对比图；如需同时保存单独 PNG，追加：
+Windows：
+
+```powershell
+& "D:\Anaconda_envs\envs\wadiff\python.exe" eval_real_screen.py `
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1\best.pt `
+  --input_dir real_screen_photos\rectified `
+  --watermark "101100101011001010110010101100" `
+  --device cuda
+```
+
+Linux：
 
 ```bash
---save_individual_samples
+/root/miniconda3/envs/wadiff/bin/python eval_real_screen.py \
+  --checkpoint checkpoints_stage2_one_shot_relaxed_v1/best.pt \
+  --input_dir real_screen_photos/rectified \
+  --watermark "101100101011001010110010101100" \
+  --device cuda
 ```
 
-评估过程中会打印处理数量、batch、用时、ETA 和各退化的临时平均 ACC。
-按 `Ctrl+C` 中断时，脚本会把已经完成的结果以 `status=interrupted` 写入
-CSV 和 metadata。如果不传 `--data_dir`，验证目录使用配置中的
-`data.val_dir`。
+提供 expected watermark 时，脚本输出逐图 ACC/BER、总体平均，并写入输入目录下的 `real_screen_results.csv`；不提供时只输出 recovered bits。真实照片不是 synthetic degradation，二者的结果必须分开报告。
 
----
+## 重要配置说明
 
-## 训练模式切换
+| 配置项 | 当前真实效力 |
+|---|---|
+| `data.watermark_length` | 正式配置均为 30 |
+| `data.image_size` | 正式配置均为 128 |
+| `train.stage` | Stage 1 当前提交值为 `full`；Stage 2 的 stage 字符串不驱动嵌套阶段逻辑 |
+| `train_watermark_mode` | Dataset 内有效，但训练 loop 会覆盖 `batch['wm_bits']`，不控制实际训练消息 |
+| `val_watermark_mode` | 有效；validation 使用 Dataset 返回的固定 bits |
+| `wm_t_min/max` | 控制训练/validation 的低时间步单步 watermark branch |
+| `train_t_start` | 控制训练脚本周期完整采样，当前为 200 |
+| `sample_steps` | 当前无 Python 调用，不生效 |
+| `freeze_watermark_map_mlp` | Stage 2 为 false，因此 spatial map MLP 可更新 |
+| `MixedNoiseLayer` | 一次 forward 只选择一种 degradation |
+| `multi_attack.attacks_per_batch` | 对同一 `pred_x0` 最多执行 4 种不同 degradation |
+| curriculum `apply_prob` | 控制该 batch 是否启用 degraded 分支 |
+| curriculum `strength` | 以 `source + strength * (full_degraded - source)` 线性混合 |
+| fixed validation matrix | 当前为 4 devices × 4 strengths，参与 checkpoint score |
 
-| 模式 | max_train_images | epochs | image_size | 用途 |
-|------|:---:|:---:|:---:|------|
-| 快速调试 | 10000 | 10 | 64 | 验证流程跑通 |
-| Stage 1 | 10000 | 80（每个手动子阶段上限） | 128 | clean嵌入、严格纹理定位与画质收敛 |
-| Stage 2 | 10000 | 100 | 128 | 渐进式四退化鲁棒训练 |
+## 已知限制与工程说明
 
-只需改 YAML，不需要改代码。
+1. 仓库不含数据、checkpoint 和最终日志，无法从当前提交复现或验证最终性能数值。
+2. `train_watermark_mode` 当前不会改变训练 loop 实际使用的 bits；训练每个 batch 直接调用 `generate_train_watermark()`。
+3. `sample_steps` 未接入采样；sample/eval CLI 默认 `t_start=300`，与正式配置 `train_t_start=200` 不同。
+4. Stage 1 Full 训练通过 `train.stages.full` 使用 `wm_map_flat_floor=.03` 和 residual budget `.003/.040, power=2.8`；独立 sample/eval 当前只读取 top-level `model/train`，会分别得到 `.05` 和 `.004/.040, power=2.2`。Stage 1 checkpoint 的独立推理因此存在配置解析不一致；Stage 2 没有该嵌套覆盖问题。
+5. sample/eval 对 diffusion model 使用 `strict=False` 加载；出现 missing/unexpected/mismatched 提示时，不应把结果视为可靠实验。
+6. 训练期 fixed matrix 基于 single-step `pred_x0`，不是完整 DDPM embedding；它适合稳定排序，但不能代替最终多步评估。
+7. `requirements.txt` 未覆盖人工校正、可选 LPIPS 和部分诊断脚本的全部附加依赖。
+8. Stage 2 YAML 顶部示例注释仍引用旧文件名 `watermark_stage2_one_shot_relaxed_v1.yaml`；仓库中的正式路径是 `configs/watermark_stage2.yaml`。
+9. `PROJECT_MANUAL.md` 和 `manual_inspection.py` 的部分中文注释存在历史编码痕迹，不影响本文所述 Python 主链逻辑。
 
-## 关键设计
+## 实验结果
 
-- **保持图像比例**：训练集将短边缩放到目标尺寸后随机裁剪；验证、采样和实拍评估使用中心裁剪，不把原图强制拉伸成正方形
-- **确定性水印**：验证集根据相对路径和 `data.watermark_seed` 固定水印；训练集按图片和 epoch 可复现地变化，避免模型记忆“图片→水印”映射
-- **实验随机种子**：`train.seed` 统一控制 Python、NumPy、PyTorch 和 DataLoader，检查点同时保存随机状态以支持可复现恢复
-- **显存控制**：`use_amp: true` 启用真实 autocast；扩散分支先反向并释放计算图，再运行水印分支，避免同时保留两套 U-Net 激活
-- **课程对齐验证**：Validation 使用当前 curriculum 的候选类型和强度、逐类型统计 ACC/BCE，并固定 bits 与 RNG；`apply_prob` 仅控制训练，验证始终施加攻击
-- **最佳模型指标**：每个验证 epoch 计算 macro/worst ACC、clean ACC、BCE、PSNR 和残差质量组成的 `balanced_score_v1`，不再只按 degraded ACC 保存
-- **按退化集合保存**：只有候选退化集合发生变化时才建立新的 `best_degradation_stage*.pt`；强度变化不会新增 best 文件
-- **梯度流**：Stage 1完整训练Encoder和Decoder；Stage 2首个课程阶段阻断degraded分支到Encoder的梯度，后续仅小幅更新部分Encoder
-- **水印解码器**：默认使用 residual multi-scale decoder；如需消融旧版 CNN baseline，可在 YAML 中设置 `decoder.type: simple`
-- **t_diff / t_wm 分离**：噪声预测用全时间步，水印损失用小时间步保证 pred_x0 稳定
-- **单步训练与完整采样**：TRAIN/VALIDATE 使用单步 `pred_x0`；周期 SAMPLE 和正式嵌入使用完整 DDPM 反向采样，两者指标不能直接横向等同
-- **图像范围**：扩散模型和 decoder 使用 `[-1,1]`；统一退化层输入输出使用 `[0,1]`，训练接入点负责转换
-- **image-to-image**：训练和采样始终从 cover 加噪出发，非纯噪声生成
-- **统一退化配置**：仅通过 `noise_layer.type` 选择退化层，支持 `none`、`pimog`、`oled`、`led`、`projector` 和 `mixed`
+当前提交不提供可核验的实验表格。
 
-## 参考文献
+```text
+Experimental results will be added after the final evaluation.
+```
 
-- WaDiff (ECCV 2024): [A Watermark-Conditioned Diffusion Model for IP Protection](https://arxiv.org/abs/2403.10893)
-- PIMoG (MM 2022): [An Effective Screen-shooting Noise-Layer Simulation for Deep-Learning-Based Watermarking Network](https://doi.org/10.1145/3503161.3548049)
+最终报告建议至少包含：固定 subset 与 full validation 的 per-device ACC/BER/message success、clean 与 end-to-end image quality、best/latest/final checkpoint 对比，以及分设备、分距离、分视角的真实屏摄结果。所有结果应记录 checkpoint、配置、`t_start`、subset indices、attack seed/strength/repeats 和拍摄设备条件。
+
+## 引用与致谢
+
+本项目使用并改造了 guided-diffusion 风格的 U-Net/DDPM 实现，并参考了以下方向：
+
+- WaDiff: *A Watermark-Conditioned Diffusion Model for IP Protection*；
+- PIMoG: *An Effective Screen-shooting Noise-Layer Simulation for Deep-Learning-Based Watermarking Network*；
+- projector-camera forward modeling / DeProCams 思路。
+
+正式公开或投稿前，请根据实际采用的上游代码补齐许可证、版权声明、准确文献条目与 BibTeX。本仓库当前尚未提供 DiffuBind 论文的最终 citation。
